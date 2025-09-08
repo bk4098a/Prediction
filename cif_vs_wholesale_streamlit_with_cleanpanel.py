@@ -1067,16 +1067,15 @@ with tabs[7]:
     # 업로더는 옵션(override)
     f = st.file_uploader("대신 업로드(옵션, cols: date, ln_cif, ln_wh)", type=["csv"], key="prop_csv")
     if f is not None:
-        df_in = read_any(f, getattr(f,"name",None))
+        df_in = read_any(f, getattr(f, "name", None))
         if df_in is not None:
             df_in.columns = [c.lower() for c in df_in.columns]
-            need = {"date","ln_cif","ln_wh"}
+            need = {"date", "ln_cif", "ln_wh"}
             if need.issubset(set(df_in.columns)):
-                df_in["date"] = month_floor(df_in["date"])
+                df_in["date"]   = month_floor(df_in["date"])
                 df_in["ln_cif"] = pd.to_numeric(df_in["ln_cif"], errors="coerce")
                 df_in["ln_wh"]  = pd.to_numeric(df_in["ln_wh"],  errors="coerce")
                 df_in = df_in.dropna(subset=["date","ln_cif","ln_wh"])
-
                 df_in = df_in.sort_values("date")
                 df_in.index = df_in["date"]
                 base = df_in[["ln_cif","ln_wh"]]
@@ -1089,67 +1088,73 @@ with tabs[7]:
         use_reg = st.checkbox("ln_wh 리그레서 사용", value=True)
         align_start = st.checkbox("첫 점 보정(연속성)", value=True)
         h = st.slider("예측 horizon (months)", 6, 24, 12, 1)
+
         if not HAS_PROPHET:
-            st.error("prophet 패키지가 설치되어 있지 않습니다.  pip install prophet") 
-else:
-    # Prophet 학습/예측 블록 (깨진 줄 싹 제거)
-    data = pd.DataFrame({
-        "ds": pd.to_datetime(base.index),
-        "y": base["ln_cif"].values,
-        "ln_wh": base["ln_wh"].values
-    })
+            st.error("prophet 패키지가 설치되어 있지 않습니다.  pip install prophet")
+        else:
+            # Prophet 학습/예측 블록
+            data = pd.DataFrame({
+                "ds": pd.to_datetime(base.index),
+                "y": base["ln_cif"].values,
+                "ln_wh": base["ln_wh"].values
+            })
 
-    m = Prophet(
-        yearly_seasonality=True,   # 월간이면 연간 seasonality는 True면 충분
-        weekly_seasonality=False,
-        daily_seasonality=False,
-        seasonality_mode="additive",
-        changepoint_prior_scale=0.05,
-        random_state=42
-    )
-    if use_reg:
-        m.add_regressor("ln_wh", standardize=True)
+            m = Prophet(
+                yearly_seasonality=True,   # 월간이면 연간 seasonality만으로도 충분
+                weekly_seasonality=False,
+                daily_seasonality=False,
+                seasonality_mode="additive",
+                changepoint_prior_scale=0.05,
+                random_state=42
+            )
+            if use_reg:
+                m.add_regressor("ln_wh", standardize=True)
 
-    m.fit(data[["ds","y","ln_wh"]] if use_reg else data[["ds","y"]])
+            m.fit(data[["ds","y","ln_wh"]] if use_reg else data[["ds","y"]])
 
-    future = m.make_future_dataframe(periods=int(h), freq="MS")
-    if use_reg:
-        # 과거는 관측치 사용, 미래 구간은 마지막 값으로 보간/연장
-        future = future.merge(data[["ds","ln_wh"]], on="ds", how="left")
-        future["ln_wh"] = future["ln_wh"].ffill()
+            future = m.make_future_dataframe(periods=int(h), freq="MS")
+            if use_reg:
+                # 과거는 관측 ln_wh 사용, 미래는 마지막 값으로 연장
+                future = future.merge(data[["ds","ln_wh"]], on="ds", how="left")
+                future["ln_wh"] = future["ln_wh"].ffill()
 
-    p = m.predict(future)
-    fc = p.tail(int(h)).copy()
+            p = m.predict(future)
+            fc = p.tail(int(h)).copy()
 
-    # 첫 점 보정(연속성)
-    try:
-        last_fit = p[p["ds"] == data["ds"].iloc[-1]]
-        bias = float(data["y"].iloc[-1] - last_fit["yhat"].iloc[0]) if (align_start and not last_fit.empty) else 0.0
-    except Exception:
-        bias = 0.0
-    for col in ["yhat","yhat_lower","yhat_upper"]:
-        fc[col] = fc[col] + bias
+            # 첫 점 보정(연속성)
+            try:
+                last_fit = p[p["ds"] == data["ds"].iloc[-1]]
+                bias = float(data["y"].iloc[-1] - last_fit["yhat"].iloc[0]) if (align_start and not last_fit.empty) else 0.0
+            except Exception:
+                bias = 0.0
+            for col in ["yhat","yhat_lower","yhat_upper"]:
+                fc[col] = fc[col] + bias
 
+            # --- 플롯 ---
             fig1, ax1 = plt.subplots(figsize=FIGSIZE, dpi=DPI)
             ax1.plot(data["ds"], data["y"], label="hist", linewidth=1.2)
             ax1.plot(fc["ds"], fc["yhat"], label="fc", linewidth=1.4)
             ax1.fill_between(fc["ds"], fc["yhat_lower"], fc["yhat_upper"], alpha=0.18)
             pretty_ax(ax1, f"Prophet{' + ln_wh' if use_reg else ''} (log)", "ln(CIF)")
             ax1.legend(frameon=False, fontsize=10, loc="upper left")
-            fig1.tight_layout(); st.pyplot(fig1, clear_figure=True)
+            fig1.tight_layout()
+            st.pyplot(fig1, clear_figure=True)
 
             fig2, ax2 = plt.subplots(figsize=FIGSIZE, dpi=DPI)
             ax2.plot(data["ds"], np.exp(data["y"]), label="hist", linewidth=1.2)
             ax2.plot(fc["ds"], np.exp(fc["yhat"]), label="fc", linewidth=1.4)
             pretty_ax(ax2, f"Prophet{' + ln_wh' if use_reg else ''} (level, mean only)", "CIF(level)")
             ax2.legend(frameon=False, fontsize=10, loc="upper left")
-            fig2.tight_layout(); st.pyplot(fig2, clear_figure=True)
+            fig2.tight_layout()
+            st.pyplot(fig2, clear_figure=True)
 
             out_tbl = fc[["ds","yhat","yhat_lower","yhat_upper"]].copy()
             out_tbl["CIF_hat"] = np.exp(out_tbl["yhat"])
             st.subheader("예측표")
-            st.dataframe(out_tbl.rename(columns={"ds":"date","yhat":"ln_cif_hat","yhat_lower":"ln_lo","yhat_upper":"ln_hi"}),
-                         use_container_width=True)
+            st.dataframe(
+                out_tbl.rename(columns={"ds":"date","yhat":"ln_cif_hat","yhat_lower":"ln_lo","yhat_upper":"ln_hi"}),
+                use_container_width=True
+            )
 
 # -------------------------------------------------------------------
 # 5) 성능 비교
