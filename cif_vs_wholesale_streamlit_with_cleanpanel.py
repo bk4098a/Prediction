@@ -830,7 +830,8 @@ def vecm_irf_plot(df, vec_lagmax, irf_h, girf=False):
 
         # 표본 기반 가능한 최대 p (보수적으로 클램프)
         feasible_max = max(1, int((nobs - 1) // (k + 1)))
-        max_p = max(1, min(int(int(user), int(ax), int(fea), max(1sible_max),) max(1, nobs // 3), 12))
+        max_p = max(1, min(int(user_max), int(feasible_max), max(1, nobs // 3), 12))
+
 
 
         # AIC로 p 선택 (실패 시 p=1~2 폴백)
