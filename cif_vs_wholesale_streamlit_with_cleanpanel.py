@@ -1092,27 +1092,43 @@ with tabs[7]:
         if not HAS_PROPHET:
             st.error("prophet 패키지가 설치되어 있지 않습니다.  pip install prophet") 
 else:
-                random_state=42
-            
-            data = pd.DataFrame({"ds": pd.to_datetime(base.index), "y": base["ln_cif"].values, "ln_wh": base["ln_wh"].values})
-            m = Prophet(yearly_seasonality=12, weekly_seasonality=False, daily_seasonality=False, seasonality_mode="additive", changepoint_prior_scale=0.05, random_state=42)# 학습 마지막 값으로 미래 구간 채우기
-                jls_extract_var = future
-                jls_extract_varfill().b
-            if use_reg: m.add_regressor("ln_wh", standardize=True)
-            m.fit(data[["ds","y","ln_wh"]] if use_reg else data[["ds","y"]])
-            future = m.make_future_dataframe(periods=int(h), freq="MS")
-            if use_reg: 
-                future = future.merge(data[["ds","ln_wh"]], on="ds", how="left")
-                # 학습 마지막 값으로 미래 구간 채우기
-                future["ln_wh"] = future["ln_wh"].ffill().bfill()
-            p = m.predict(future); fc = p.tail(int(h)).copy()
-            try:
-                last_fit = p[p["ds"] == data["ds"].iloc[-1]]
-                bias = float(data["y"].iloc[-1] - last_fit["yhat"].iloc[0]) if (align_start and not last_fit.empty) else 0.0
-            except Exception:
-                bias = 0.0
-            for col in ["yhat","yhat_lower","yhat_upper"]:
-                fc[col] = fc[col] + bias
+    # Prophet 학습/예측 블록 (깨진 줄 싹 제거)
+    data = pd.DataFrame({
+        "ds": pd.to_datetime(base.index),
+        "y": base["ln_cif"].values,
+        "ln_wh": base["ln_wh"].values
+    })
+
+    m = Prophet(
+        yearly_seasonality=True,   # 월간이면 연간 seasonality는 True면 충분
+        weekly_seasonality=False,
+        daily_seasonality=False,
+        seasonality_mode="additive",
+        changepoint_prior_scale=0.05,
+        random_state=42
+    )
+    if use_reg:
+        m.add_regressor("ln_wh", standardize=True)
+
+    m.fit(data[["ds","y","ln_wh"]] if use_reg else data[["ds","y"]])
+
+    future = m.make_future_dataframe(periods=int(h), freq="MS")
+    if use_reg:
+        # 과거는 관측치 사용, 미래 구간은 마지막 값으로 보간/연장
+        future = future.merge(data[["ds","ln_wh"]], on="ds", how="left")
+        future["ln_wh"] = future["ln_wh"].ffill()
+
+    p = m.predict(future)
+    fc = p.tail(int(h)).copy()
+
+    # 첫 점 보정(연속성)
+    try:
+        last_fit = p[p["ds"] == data["ds"].iloc[-1]]
+        bias = float(data["y"].iloc[-1] - last_fit["yhat"].iloc[0]) if (align_start and not last_fit.empty) else 0.0
+    except Exception:
+        bias = 0.0
+    for col in ["yhat","yhat_lower","yhat_upper"]:
+        fc[col] = fc[col] + bias
 
             fig1, ax1 = plt.subplots(figsize=FIGSIZE, dpi=DPI)
             ax1.plot(data["ds"], data["y"], label="hist", linewidth=1.2)
