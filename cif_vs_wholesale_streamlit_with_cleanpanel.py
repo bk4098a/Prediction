@@ -1189,8 +1189,7 @@ with tabs[7]:
                 weekly_seasonality=False,
                 daily_seasonality=False,
                 seasonality_mode="additive",
-                changepoint_prior_scale=0.05,
-                random_state=42
+                changepoint_prior_scale=0.05
             )
             if use_reg:
                 m.add_regressor("ln_wh", standardize=True)
@@ -1329,8 +1328,7 @@ with tabs[8]:
                         weekly_seasonality=False,
                         daily_seasonality=False,
                         seasonality_mode="additive",
-                        changepoint_prior_scale=0.05,
-                        random_state=42
+                        changepoint_prior_scale=0.05
                     )
                     if pr_use_reg:
                         m.add_regressor("ln_wh", standardize=True)
