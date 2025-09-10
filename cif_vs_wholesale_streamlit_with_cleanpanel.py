@@ -22,6 +22,7 @@ from statsmodels.tsa.arima.model import ARIMA
 from statsmodels.tsa.vector_ar.vecm import coint_johansen, VECM, select_order as vecm_select_order
 from statsmodels.tsa.stattools import adfuller, kpss, coint, grangercausalitytests
 from pathlib import Path
+from typing import Optional
 
 
 BASE_DIR = Path(r"C:\Users\KimByeolha\OneDrive - 트릿지\예측지계산_20250901")
@@ -318,17 +319,26 @@ def build_pair_panel(
 # ---------------------------
 # Tests & Reports
 # ---------------------------
-def adf_report(x: pd.Series, name: str) -> str:
+def adf_report(x: pd.Series, name: str, regression: Optional[str] = None) -> str:
+    """
+    regression:
+      - None  → c/ct 두 케이스 모두 요약(신규 방식)
+      - 'c','ct','ctt','n' → 해당 케이스만 반환(구 방식과 호환)
+    """
     x = x.dropna().astype(float)
-    if len(x) < 10: return f"{name}: 데이터 부족 (n={len(x)})"
-    def one(reg):
-        stat, pval, _, _, crit, _ = adfuller(x, regression=reg, autolag="AIC")
-        cv5 = crit.get("5%"); dec = "정상(기각)" if stat < cv5 else "비정상(기각 실패)"
-        return f"{reg}: stat={stat:.3f}, cv5={cv5:.3f}, p={pval:.3f} → {dec}"
-    c = one("c")
-    ct = one("ct")
-    return f"ADF[{name}] | {c} | {ct}"
+    if len(x) < 10:
+        return f"{name}: 데이터 부족 (n={len(x)})"
 
+    def one(reg: str) -> str:
+        stat, pval, _, _, crit, _ = adfuller(x, regression=reg, autolag="AIC")
+        cv5 = crit.get("5%")
+        dec = "정상(기각)" if stat < cv5 else "비정상(기각 실패)"
+        return f"{reg}: stat={stat:.3f}, cv5={cv5:.3f}, p={pval:.3f} → {dec}"
+
+    if regression in ("c","ct","ctt","n"):
+        return f"ADF[{name}] | {one(regression)}"
+    else:
+        return f"ADF[{name}] | {one('c')} | {one('ct')}"
 def kpss_report(x: pd.Series, name: str, regression: str = "c") -> str:
     x = x.dropna().astype(float)
     if len(x) < 10:
@@ -815,29 +825,27 @@ with tabs[2]:
 # 검증B) 공적분 · 그랜저
 # -------------------------------------------------------------------
 with tabs[3]:
-    ...
-    r_msg = johansen_report(df[["ln_cif","ln_wh"]])
-    st.write(r_msg)
-    if "r=0" in r_msg:
-        st.caption("추천: 공적분 없음 → Δlog VAR 기반 Granger")
-    elif "r=≥1" in r_msg:
-        st.caption("추천: 공적분 있음 → VECM(장·단기) 기반 Granger")
     st.subheader("공적분 & 그랜저 인과성")
     df = st.session_state.get("model_df")
     if df is None or df.empty:
         st.info("먼저 0) 탭에서 패널을 선택하세요.")
     else:
+        r_msg = johansen_report(df[["ln_cif","ln_wh"]])
+        st.write(r_msg)
+        if "r=0" in r_msg:
+            st.caption("추천: 공적분 없음 → Δlog VAR 기반 Granger")
+        elif "r=≥1" in r_msg:
+            st.caption("추천: 공적분 있음 → VECM(장·단기) 기반 Granger")
+
         st.write(eg_coint_report(df["ln_cif"], df["ln_wh"], "ln_cif", "ln_wh"))
-        try:
-            st.write(johansen_report(df[["ln_cif","ln_wh"]]))
-        except Exception:
-            pass
+
         maxlag = st.slider("Granger max lag", 2, 12, 6, 1, key="gr_lag")
         dd = df.copy()
         dd["dln_cif"] = np.r_[np.nan, np.diff(dd["ln_cif"].values)]
         dd["dln_wh"]  = np.r_[np.nan, np.diff(dd["ln_wh"].values)]
         tbl = granger_table_dlog(dd, maxlag=maxlag)
         st.dataframe(tbl, use_container_width=True)
+
 
 # -------------------------------------------------------------------
 # 1) OLS
@@ -1102,13 +1110,6 @@ with tabs[6]:
                 lo_arr = np.minimum(ci_np[:,0], ci_np[:,1])
                 hi_arr = np.maximum(ci_np[:,0], ci_np[:,1])
 
-                if hasattr(ci, "to_numpy"):
-                        ci_np = ci.to_numpy()
-                else:
-                        ci_np = np.asarray(ci)
-                lo_arr = ci_np[:, 0]
-                hi_arr = ci_np[:, 1]
-
                 ln_last = df["ln_cif"].values[-1]
                 ln_hat = ln_last + np.cumsum(dln_fc)
                 ln_lo  = ln_last + np.cumsum(lo_arr)
@@ -1249,66 +1250,118 @@ with tabs[8]:
     if df is None or df.empty:
         st.info("먼저 0) 탭에서 패널을 선택하세요.")
     else:
-        h_eval = st.slider("홀드아웃 길이(h)", min_value=6, max_value=18, value=12, step=1, key="eval_h")
+        h_eval     = st.slider("홀드아웃 길이(h)", min_value=6, max_value=18, value=12, step=1, key="eval_h")
         pr_use_reg = st.checkbox("Prophet에 ln_wh 리그레서 사용", value=True)
+        pr_align   = st.checkbox("Prophet 첫 점 보정(연속성)", value=True)
+        use_real_x = st.checkbox("ECM-ARIMAX 평가 시 ln_wh에 실제값 사용(상한)", value=True, key="eval_use_real_x")
+
         if st.button("평가 실행", key="eval_run"):
             if len(df) <= int(h_eval) + 12:
                 st.error("표본이 너무 짧습니다. h를 줄이세요.")
             else:
+                # ---------------------------
+                # Split
+                # ---------------------------
                 train = df.iloc[:-int(h_eval)]
                 test  = df.iloc[-int(h_eval):]
 
+                # ---------------------------
                 # ECM-ARIMAX
+                # ---------------------------
                 vec_pick = pick_vecm(train[["ln_cif","ln_wh"]], nmax=12)
                 has_coint = vec_pick is not None
                 vec_res = vec_pick["res"] if has_coint else None
+
                 ect, beta, mu = make_ect(train, vec_res if has_coint else None)
                 tr = train.copy(); tr["ect"] = ect
+
                 best = None
+                recs = []
                 for L in range(0, 4):
                     D = design_matrix_for_ecm(tr, L=L, include_ect=has_coint)
-                    if D.empty: continue
-                    y = D["dln_cif"].values; X = D.drop(columns=["dln_cif"]).values
+                    if D.empty:
+                        continue
+                    y = D["dln_cif"].values
+                    X = D.drop(columns=["dln_cif"]).values
                     fit, _tab = fit_arima_grid(y, X=X, seasonal=False)
-                    if fit is None: continue
+                    if fit is None:
+                        continue
+                    recs.append({"L": L, "n": len(y), "AICc": round(fit["AICc"], 2), "BIC": round(fit["BIC"], 2)})
                     if (best is None) or (fit["AICc"] < best["AICc"]):
-                        best = {"res": fit["res"], "L": L, "AICc": fit["AICc"]}
-                use_real_x = st.checkbox("평가 시 ln_wh에 실제값 사용(상한)", value=True, key="eval_use_real_x")
-                ln_wh_future = (test["ln_wh"].values if use_real_x
-                                else forecast_lnwh(train, h=len(test), vecm_res=vec_res, method="vec")[0])
+                        best = {"res": fit["res"], "L": L, "AICc": fit["AICc"], "BIC": fit["BIC"]}
+
+                if best is None:
+                    st.error("ECM-ARIMAX 선택 실패 (표본 부족/라그 과다/수렴 실패). L 범위를 줄이거나 데이터 기간을 늘리세요.")
+                    st.stop()
+
+                # 미래 exog (상한/현실 시나리오)
+                if use_real_x:
+                    ln_wh_future = test["ln_wh"].values
+                else:
+                    ln_wh_future, _ln_cif_dummy = forecast_lnwh(train, h=len(test), vecm_res=vec_res, method="vec")
+
                 ln_cif0 = np.repeat(train["ln_cif"].values[-1], len(test))
                 Xf = build_future_xreg(tr, L=best["L"], h=len(test), beta=beta, mu=mu,
                                        ln_wh_future=ln_wh_future, ln_cif0=ln_cif0)
                 Xf_aligned = align_xreg(best["res"], Xf)
+                if Xf_aligned is None:
+                    st.error("ARIMAX에 필요한 외생변수 정렬에 실패했습니다. (학습 시 exog가 없거나 컬럼 미일치)")
+                    st.stop()
+
                 pred_ax = best["res"].get_forecast(steps=len(test), exog=Xf_aligned)
                 dln_ax = np.asarray(pred_ax.predicted_mean)
                 ln_ax  = train["ln_cif"].values[-1] + np.cumsum(dln_ax)
 
+                # ---------------------------
                 # Prophet
+                # ---------------------------
                 if not HAS_PROPHET:
                     st.warning("prophet 미설치 — Prophet 평가는 생략")
                     ln_pr = np.full(len(test), np.nan)
                 else:
-                    M = pd.DataFrame({"ds": pd.to_datetime(train.index), "y": train["ln_cif"].values, "ln_wh": train["ln_wh"].values})
-                    m = Prophet(yearly_seasonality=12, weekly_seasonality=False, daily_seasonality=False,
-                                seasonality_mode="additive", changepoint_prior_scale=0.05)
-                    if pr_use_reg: m.add_regressor("ln_wh", standardize=True)
-                    m.fit(M[["ds","y","ln_wh"]] if pr_use_reg else M[["ds","y"]])
-                    fut = pd.DataFrame({"ds": pd.to_datetime(test.index)})
-                    if pr_use_reg: fut["ln_wh"] = test["ln_wh"].values
-                    p = m.predict(fut); ln_pr = p["yhat"].values
-                    if pr_align:
-                        last_fit = m.predict(pd.DataFrame({"ds":[train.index[-1]]}))
-                        ln_pr = ln_pr + (train["ln_cif"].values[-1] - last_fit["yhat"].iloc[0])
+                    M = pd.DataFrame({
+                        "ds": pd.to_datetime(train.index),
+                        "y":  train["ln_cif"].values,
+                        "ln_wh": train["ln_wh"].values
+                    })
+                    m = Prophet(
+                        yearly_seasonality=True,
+                        weekly_seasonality=False,
+                        daily_seasonality=False,
+                        seasonality_mode="additive",
+                        changepoint_prior_scale=0.05,
+                        random_state=42
+                    )
+                    if pr_use_reg:
+                        m.add_regressor("ln_wh", standardize=True)
 
+                    m.fit(M[["ds","y","ln_wh"]] if pr_use_reg else M[["ds","y"]])
+
+                    fut = pd.DataFrame({"ds": pd.to_datetime(test.index)})
+                    if pr_use_reg:
+                        fut["ln_wh"] = test["ln_wh"].values
+
+                    p = m.predict(fut)
+                    ln_pr = p["yhat"].values
+
+                    if pr_align:
+                        # 마지막 학습시점 예측값과 실제 값을 맞추는 오프셋 보정
+                        last_fit = m.predict(pd.DataFrame({"ds":[train.index[-1]]}))
+                        if not last_fit.empty:
+                            bias = float(train["ln_cif"].values[-1] - last_fit["yhat"].iloc[0])
+                            ln_pr = ln_pr + bias
+
+                # ---------------------------
+                # Metrics (level 기준 + 방향 적중)
+                # ---------------------------
                 y_true_lvl = np.exp(test["ln_cif"].values)
                 ax_lvl = np.exp(ln_ax)
                 pr_lvl = np.exp(ln_pr) if np.all(np.isfinite(ln_pr)) else np.full_like(y_true_lvl, np.nan)
 
                 res_tab = pd.DataFrame({
                     "Model": [
-                        f"ECM-ARIMAX{' (ECT 포함)' if has_coint else ''}",
-                        f"Prophet{' + ln_wh' if pr_use_reg else ''}",
+                        f"ECM-ARIMAX{' (ECT 포함)' if has_coint else ''} {'[상한]' if use_real_x else '[현실]'}",
+                        f"Prophet{' + ln_wh' if pr_use_reg else ''}{' + StartAlign' if pr_align else ''}",
                     ],
                     "RMSE": [round(rmse(y_true_lvl, ax_lvl), 3),
                              round(rmse(y_true_lvl, pr_lvl), 3) if np.isfinite(pr_lvl).all() else np.nan],
@@ -1319,5 +1372,9 @@ with tabs[8]:
                         round(hit_ratio(test["ln_cif"].values, ln_pr), 1) if np.isfinite(ln_pr).all() else np.nan,
                     ],
                 })
+
                 st.write(f"홀드아웃 구간: {test.index.min().date()} ~ {test.index.max().date()}")
+                if recs:
+                    st.write("ARIMAX 라그 선택(AICc)")
+                    st.dataframe(pd.DataFrame(recs), use_container_width=True)
                 st.dataframe(res_tab, use_container_width=True)
