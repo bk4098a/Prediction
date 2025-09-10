@@ -106,16 +106,33 @@ def parse_dt_series(s: pd.Series) -> pd.Series:
     if pd.api.types.is_datetime64_any_dtype(s):
         return month_floor(s)
     if pd.api.types.is_numeric_dtype(s):
+        # 정수형 YYYYMM / YYYYMMDD 감지
+        si = pd.to_numeric(s, errors="coerce").dropna()
+        # 전부 정수처럼 보이고 자릿수 일관되면 패턴 판별
+        if (si.round() == si).all():
+            slen = si.astype(str).str.len().mode().iloc[0] if len(si) else 0
+            if slen == 6:  # YYYYMM
+                dt = pd.to_datetime(si.astype(int).astype(str) + "01", format="%Y%m%d", errors="coerce")
+                return month_floor(dt)
+            if slen == 8:  # YYYYMMDD
+                dt = pd.to_datetime(si.astype(int).astype(str), format="%Y%m%d", errors="coerce")
+                return month_floor(dt)
+        # 그 외에는 엑셀 날짜로 처리
         dt = _EXCEL_ORIGIN + pd.to_timedelta(s.astype(float), unit="D")
         return month_floor(dt)
     s = s.astype(str).str.replace(r"[./]", "-", regex=True)
     return month_floor(pd.to_datetime(s, errors="coerce"))
 
+
 def numify_series(s: pd.Series) -> pd.Series:
-    s = s.astype(str)
-    s = s.str.replace(r"[^0-9.,-]", "", regex=True)
+    # 과학표기 허용: 부호, 소수점, 'e'/'E'
+    s = s.astype(str).str.strip()
+    # 천단위 콤마 제거
     s = s.str.replace(",", "", regex=False)
+    # 허용 문자만 남기되, 공백 구분 여러 숫자가 섞인 경우 첫 토큰만 사용
+    s = s.str.extract(r'([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?)', expand=False)
     return pd.to_numeric(s, errors="coerce")
+
 
 def read_any(path_or_buffer, name: Optional[str] = None) -> Optional[pd.DataFrame]:
     if path_or_buffer is None:
@@ -133,11 +150,11 @@ def read_any(path_or_buffer, name: Optional[str] = None) -> Optional[pd.DataFram
         for enc in ("utf-8", "cp949", "latin1"):
             try:
                 bio.seek(0)
-                return pd.read_csv(bio, encoding=enc)
+                return pd.read_csv(bio, encoding=enc, engine="python", on_bad_lines="skip")
             except Exception:
                 continue
         bio.seek(0)
-        return pd.read_csv(bio, encoding_errors="ignore")
+        return pd.read_csv(bio, engine="python", on_bad_lines="skip")
     else:
         path = str(path_or_buffer)
         ext = (os.path.splitext(name or path)[1] or "").lower()
@@ -148,10 +165,11 @@ def read_any(path_or_buffer, name: Optional[str] = None) -> Optional[pd.DataFram
                 return pd.read_excel(path, engine="openpyxl")
         for enc in ("utf-8", "cp949", "latin1"):
             try:
-                return pd.read_csv(path, encoding=enc)
+                return pd.read_csv(path, encoding=enc, engine="python", on_bad_lines="skip")
             except Exception:
                 continue
-        return pd.read_csv(path, encoding_errors="ignore")
+        return pd.read_csv(path, engine="python", on_bad_lines="skip")
+
 
 # ---------------------------
 # Column auto-detect helpers
@@ -300,14 +318,16 @@ def build_pair_panel(
 # ---------------------------
 # Tests & Reports
 # ---------------------------
-def adf_report(x: pd.Series, name: str, regression: str = "c") -> str:
+def adf_report(x: pd.Series, name: str) -> str:
     x = x.dropna().astype(float)
-    if len(x) < 10:
-        return f"{name}: 데이터 부족 (n={len(x)})"
-    stat, pval, _, _, crit, _ = adfuller(x, regression=regression, autolag="AIC")
-    cv5 = crit.get("5%")
-    dec = "정상(기각)" if stat < cv5 else "비정상(기각 실패)"
-    return f"ADF[{regression}] stat={stat:.3f}, cv5={cv5:.3f}, p={pval:.3f} → {dec}"
+    if len(x) < 10: return f"{name}: 데이터 부족 (n={len(x)})"
+    def one(reg):
+        stat, pval, _, _, crit, _ = adfuller(x, regression=reg, autolag="AIC")
+        cv5 = crit.get("5%"); dec = "정상(기각)" if stat < cv5 else "비정상(기각 실패)"
+        return f"{reg}: stat={stat:.3f}, cv5={cv5:.3f}, p={pval:.3f} → {dec}"
+    c = one("c")
+    ct = one("ct")
+    return f"ADF[{name}] | {c} | {ct}"
 
 def kpss_report(x: pd.Series, name: str, regression: str = "c") -> str:
     x = x.dropna().astype(float)
@@ -336,9 +356,13 @@ def select_order(X, maxlags=12, deterministic="co"):
         class Dummy: k_ar_diff = 1
         return Dummy()
 
-def johansen_rank(X, det_order=0):
-    res = coint_johansen(X, det_order, k_ar_diff=1)
+def johansen_rank(X: pd.DataFrame, det_order: int = 0, maxlags: int = 12) -> int:
+    X = X.dropna()
+    sel = select_order(X, maxlags=min(maxlags, max(2, len(X)//10)), deterministic="co")
+    k = int(getattr(sel, "k_ar_diff", 1))
+    res = coint_johansen(X, det_order, k_ar_diff=max(1, k))
     return 1 if (res.lr1[0] > res.cvt[0, 1]) else 0  # 5%
+
 
 def johansen_report(df2: pd.DataFrame) -> str:
     X = df2[["ln_cif", "ln_wh"]].dropna()
@@ -355,8 +379,9 @@ def johansen_report(df2: pd.DataFrame) -> str:
 
 def granger_table_dlog(df_xy: pd.DataFrame, maxlag: int = 6) -> pd.DataFrame:
     d = df_xy[["dln_cif", "dln_wh"]].dropna()
-    if len(d) < maxlag + 5:
-        return pd.DataFrame({"msg": [f"표본 부족 n={len(d)}"]})
+    need = max(12, 8 + 4*maxlag)
+    if len(d) < need:
+        return pd.DataFrame({"msg": [f"표본 부족 n={len(d)} (≥{need} 권장)"]})
     out = []
     res1 = grangercausalitytests(d[["dln_cif", "dln_wh"]], maxlag=maxlag, verbose=False)  # wh→cif
     res2 = grangercausalitytests(d[["dln_wh", "dln_cif"]], maxlag=maxlag, verbose=False)  # cif→wh
@@ -366,11 +391,17 @@ def granger_table_dlog(df_xy: pd.DataFrame, maxlag: int = 6) -> pd.DataFrame:
         out.append({"lag": L, "H0: wh ↛ cif (p)": p1, "H0: cif ↛ wh (p)": p2})
     return pd.DataFrame(out)
 
+
 # ---------------------------
 # Modeling helpers
 # ---------------------------
 def rmse(a, b): a = np.asarray(a); b = np.asarray(b); return float(np.sqrt(np.nanmean((a - b) ** 2)))
-def mape(a, b): a = np.asarray(a); b = np.asarray(b); return float(np.nanmean(np.abs((a - b) / a)) * 100)
+def mape(a, b):
+    a = np.asarray(a, dtype=float); b = np.asarray(b, dtype=float)
+    mask = np.isfinite(a) & np.isfinite(b) & (np.abs(a) > 1e-12)
+    if mask.sum() == 0: return np.nan
+    return float(np.nanmean(np.abs((a[mask] - b[mask]) / a[mask])) * 100)
+
 def hit_ratio(y_true_log, y_hat_log):
     dy_true = np.diff(np.asarray(y_true_log)); dy_hat = np.diff(np.asarray(y_hat_log))
     ok = np.isfinite(dy_true) & np.isfinite(dy_hat)
@@ -379,45 +410,56 @@ def hit_ratio(y_true_log, y_hat_log):
 
 def ols_with_aic(df, L):
     d = df.copy()
+    if len(d) < max(12, 4*L + 8):
+        return None, 0, np.inf
     d["wh_lag"] = d["ln_wh"].shift(L)
     d = d.dropna()
+    if len(d) < 10: return None, 0, np.inf
     X = sm.add_constant(d[["wh_lag"]])
     y = d["ln_cif"]
     model = sm.OLS(y, X).fit()
     return model, len(d), model.aic
 
 def pick_vecm(df, nmax=12):
-    X = df[["ln_cif", "ln_wh"]].dropna()
-    if len(X) < 24:
-        return None
+    X = df[["ln_cif","ln_wh"]].dropna()
+    if len(X) < 24: return None
     try:
         order = select_order(X, maxlags=nmax, deterministic="co")
         k = int(getattr(order, "k_ar_diff", 1))
-        rank = johansen_rank(X, det_order=0)
+        rank = johansen_rank(X, det_order=0, maxlags=nmax)  # 동일 기준 사용
         if rank >= 1:
-            vecm = VECM(X, k_ar_diff=max(1, k), coint_rank=1, deterministic="co")
+            vecm = VECM(X, k_ar_diff=max(1,k), coint_rank=rank, deterministic="co")
             res = vecm.fit()
-            return {"res": res, "k": max(1, k), "rank": 1}
+            return {"res": res, "k": max(1,k), "rank": rank}
         return None
     except Exception:
         return None
 
 def make_ect(df, vecm_res=None):
-    X = df[["ln_cif", "ln_wh"]].dropna()
+    X = df[["ln_cif","ln_wh"]].copy()
     beta = None
     if vecm_res is not None:
         try:
-            beta = np.asarray(vecm_res.beta[:, [0]])
+            beta = np.asarray(vecm_res.beta[:, [0]])  # (k,1)
         except Exception:
             beta = None
     if beta is None:
-        eg = sm.OLS(X["ln_cif"], sm.add_constant(X["ln_wh"])).fit()
-        b1 = eg.params["ln_wh"]; beta = np.array([[1.0], [-b1]])
-    M = np.column_stack([df["ln_cif"].values, df["ln_wh"].values])
-    ect_raw = M @ beta
-    mu = np.nanmean(ect_raw)
-    ect = ect_raw - mu
-    return ect.ravel(), beta, float(mu)
+        # EG 대용: ln_cif ~ ln_wh
+        tmp = X.dropna()
+        eg = sm.OLS(tmp["ln_cif"], sm.add_constant(tmp["ln_wh"])).fit()
+        b1 = eg.params["ln_wh"]
+        beta = np.array([[1.0], [-b1]])  # β' y_t = ln_cif - b1*ln_wh
+
+    # 유효 구간만 계산
+    valid = X.dropna()
+    Mv = valid.values @ beta
+    mu = float(np.mean(Mv))
+    ect_valid = (Mv - mu).ravel()
+
+    # 원 인덱스에 맞춰 재배치
+    ect = pd.Series(index=X.index, dtype=float)
+    ect.loc[valid.index] = ect_valid
+    return ect.values, beta, mu
 
 def design_matrix_for_ecm(df, L, include_ect=True):
     dln_wh = np.r_[np.nan, np.diff(df["ln_wh"].values)]
@@ -451,49 +493,54 @@ def fit_arima_grid(y, X=None, seasonal=False, max_p=3, max_d=1, max_q=3):
 
 def align_xreg(fitted_res, Xnew):
     try:
-        xr = fitted_res.model.exog_names
-        xr = [c for c in xr if c != "const"] if xr else None
+        xr = fitted_res.model.exog_names or None
     except Exception:
         xr = None
-    if xr is None or Xnew is None: return None
+    if xr is None or Xnew is None:
+        return None
+    xr = [c for c in xr if c != "const"]
+    if not xr:
+        return None
     X = Xnew.copy()
     for c in xr:
         if c not in X.columns: X[c] = 0.0
-    return X[xr].values
+    return X[xr].to_numpy()
 
 def forecast_lnwh(df, h, vecm_res=None, method="vec"):
-    last_ln_cif = df["ln_cif"].iloc[-1]; last_ln_wh = df["ln_wh"].iloc[-1]
+    last_ln_cif = float(df["ln_cif"].iloc[-1]); last_ln_wh = float(df["ln_wh"].iloc[-1])
     if method == "vec" and vecm_res is not None:
         try:
-            fc = vecm_res.predict(steps=h)
-            names = list(vecm_res.names)
-            i_wh = names.index("ln_wh") if "ln_wh" in names else 1
-            i_cif = names.index("ln_cif") if "ln_cif" in names else 0
+            fc = vecm_res.predict(steps=h)  # (h,k)
+            names = list(getattr(vecm_res, "names", [])) or ["ln_cif","ln_wh"]
+            name_to_ix = {n:i for i,n in enumerate(names)}
+            i_wh = name_to_ix.get("ln_wh", 1)
+            i_cif = name_to_ix.get("ln_cif", 0)
             return fc[:, i_wh], fc[:, i_cif]
         except Exception:
             pass
+    # 폴백: ARIMA(ln_wh), CIF는 홀드
     try:
         best, _ = fit_arima_grid(df["ln_wh"].values, X=None, seasonal=False)
-        if best is not None: 
+        if best is not None:
             pred = best["res"].get_forecast(steps=h)
-            ln_wh_future = pred.predicted_mean.values
+            ln_wh_future = np.asarray(pred.predicted_mean)
         else:
-            ln_wh_future = np.repeat(df["ln_wh"].values[-1], h)
-
+            ln_wh_future = np.repeat(last_ln_wh, h)
         return ln_wh_future, np.repeat(last_ln_cif, h)
     except Exception:
-        ln_wh_future = np.repeat(last_ln_wh, h)
-        return ln_wh_future, np.repeat(last_ln_cif, h)
+        return np.repeat(last_ln_wh, h), np.repeat(last_ln_cif, h)
 
 def build_future_xreg(df, L, h, beta, mu, ln_wh_future, ln_cif0):
     d_hist = np.r_[np.nan, np.diff(df["ln_wh"].values)]
-    d_fut = np.r_[np.nan, np.diff(np.r_[df["ln_wh"].values[-1], ln_wh_future])][1:]
-    d_pad = np.r_[d_hist[-L:], d_fut]
-    Xcols = {f"dln_wh_L{lag}": d_pad[(L - lag):(L - lag + h)] for lag in range(L + 1)}
+    d_fut  = np.r_[np.nan, np.diff(np.r_[df["ln_wh"].values[-1], ln_wh_future])][1:]
+    d_pad  = np.r_[d_hist[-L:], d_fut]
+    Xcols  = {f"dln_wh_L{lag}": d_pad[(L - lag):(L - lag + h)] for lag in range(L + 1)}
     Xf = pd.DataFrame(Xcols)
-    pair = np.column_stack([ln_cif0, ln_wh_future])
+
+    ln_cif_rep = np.repeat(float(ln_cif0), h)
+    pair = np.column_stack([ln_cif_rep, ln_wh_future])  # (h,2)
     ect_raw = pair @ beta
-    ect_l1 = np.r_[df["ect"].values[-1], (ect_raw - mu).ravel()][0:h]
+    ect_l1  = np.r_[df["ect"].values[-1], (ect_raw - mu).ravel()][0:h]  # 길이 h
     Xf["ect_l1"] = ect_l1
     return Xf
 
@@ -768,6 +815,13 @@ with tabs[2]:
 # 검증B) 공적분 · 그랜저
 # -------------------------------------------------------------------
 with tabs[3]:
+    ...
+    r_msg = johansen_report(df[["ln_cif","ln_wh"]])
+    st.write(r_msg)
+    if "r=0" in r_msg:
+        st.caption("추천: 공적분 없음 → Δlog VAR 기반 Granger")
+    elif "r=≥1" in r_msg:
+        st.caption("추천: 공적분 있음 → VECM(장·단기) 기반 Granger")
     st.subheader("공적분 & 그랜저 인과성")
     df = st.session_state.get("model_df")
     if df is None or df.empty:
@@ -795,16 +849,37 @@ with tabs[4]:
         st.info("먼저 0) 탭에서 패널을 선택하세요.")
     else:
         maxL = st.number_input("최대 시차(L) 탐색", min_value=0, max_value=12, value=3, step=1)
+
+        # 버튼은 탭 블록 안에 있어야 함
         if st.button("OLS 적합", key="ols_run"):
-            rows = []; best = None
+            rows = []
+            best = None
+
             for L in range(int(maxL) + 1):
                 mdl, n, aic_val = ols_with_aic(df, L)
-                rows.append({"L": L, "n": n, "AIC": round(aic_val, 2)})
-                if (best is None) or (aic_val < best["aic"]):
-                    best = {"model": mdl, "L": L, "aic": aic_val}
-            st.write("라그별 AIC"); st.dataframe(pd.DataFrame(rows), use_container_width=True)
-            st.write(f"**선택: L={best['L']} (AIC={best['aic']:.2f})**")
-            st.text(best["model"].summary().as_text())
+                # AIC가 무한대/유효하지 않으면 None로 표기
+                aic_cell = None if (aic_val is None or not np.isfinite(aic_val)) else round(aic_val, 2)
+                rows.append({"L": L, "n": n, "AIC": aic_cell})
+
+                # 최적 모델 갱신 (유효한 모델 + 유효한 AIC만)
+                if (mdl is not None) and (aic_val is not None) and np.isfinite(aic_val):
+                    if (best is None) or (aic_val < best["aic"]):
+                        best = {"model": mdl, "L": L, "aic": float(aic_val)}
+
+            st.write("라그별 AIC")
+            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+            if (best is None) or (best.get("model") is None):
+                st.warning("적합 가능한 OLS가 없습니다. 표본/라그 범위를 줄이세요.")
+            else:
+                st.write(f"**선택: L={best['L']} (AIC={best['aic']:.2f})**")
+                # 일부 환경에서 summary 출력이 긴 텍스트라 렌더링 오류 날 수 있어 try로 감쌈
+                try:
+                    st.text(best["model"].summary().as_text())
+                except Exception:
+                    st.write(best["model"].params)
+
+
 
 # -------------------------------------------------------------------
 # 2) 공적분·VECM & IRF
@@ -854,7 +929,11 @@ def vecm_irf_plot(df, vec_lagmax, irf_h, girf=False):
             p = 1
             var_d = VAR(dd).fit(p)
 
-        st.info(f"공적분 r=0 → VAR(Δln) IRF 대체. 사용 p={p} (요청 {user_max}, 표본상한 {feasible_max}, 캡 {max_p}, n={nobs}).")
+        st.info(
+            f"공적분 r=0 → VAR(Δln) IRF. 최종 p={p} "
+            f"(탐색상한={max_p}, 표본 n={nobs})."
+        )
+
 
         # IRF (충격: dln_wh → 반응: dln_cif)
         irf = var_d.irf(int(irf_h))
@@ -1009,7 +1088,8 @@ with tabs[6]:
                 if (best is None) or (aicc_val < best["AICc"]):
                     best = {"fit": fit["res"], "L": L, "AICc": aicc_val, "BIC": bic_val}
             if best is None:
-                st.error("ARIMAX 선택 실패")
+                st.error("ARIMAX 선택 실패 (표본 부족/라그 과다/수렴 실패). Lmax를 줄이거나 데이터 기간을 늘리세요.")
+                st.stop()
             else:
                 ln_wh_future, ln_cif0 = forecast_lnwh(df, h=int(h_steps), vecm_res=vec_res, method=scn)
                 Xf = build_future_xreg(dwork, L=best["L"], h=int(h_steps), beta=beta, mu=mu,
@@ -1018,6 +1098,10 @@ with tabs[6]:
                 pred = best["fit"].get_forecast(steps=int(h_steps), exog=Xf_aligned)
                 dln_fc = np.asarray(pred.predicted_mean)
                 ci = pred.conf_int(alpha=1 - conf/100.0)
+                ci_np = ci.to_numpy() if hasattr(ci, "to_numpy") else np.asarray(ci)
+                lo_arr = np.minimum(ci_np[:,0], ci_np[:,1])
+                hi_arr = np.maximum(ci_np[:,0], ci_np[:,1])
+
                 if hasattr(ci, "to_numpy"):
                         ci_np = ci.to_numpy()
                 else:
@@ -1189,7 +1273,9 @@ with tabs[8]:
                     if fit is None: continue
                     if (best is None) or (fit["AICc"] < best["AICc"]):
                         best = {"res": fit["res"], "L": L, "AICc": fit["AICc"]}
-                ln_wh_future = test["ln_wh"].values
+                use_real_x = st.checkbox("평가 시 ln_wh에 실제값 사용(상한)", value=True, key="eval_use_real_x")
+                ln_wh_future = (test["ln_wh"].values if use_real_x
+                                else forecast_lnwh(train, h=len(test), vecm_res=vec_res, method="vec")[0])
                 ln_cif0 = np.repeat(train["ln_cif"].values[-1], len(test))
                 Xf = build_future_xreg(tr, L=best["L"], h=len(test), beta=beta, mu=mu,
                                        ln_wh_future=ln_wh_future, ln_cif0=ln_cif0)
@@ -1211,6 +1297,9 @@ with tabs[8]:
                     fut = pd.DataFrame({"ds": pd.to_datetime(test.index)})
                     if pr_use_reg: fut["ln_wh"] = test["ln_wh"].values
                     p = m.predict(fut); ln_pr = p["yhat"].values
+                    if pr_align:
+                        last_fit = m.predict(pd.DataFrame({"ds":[train.index[-1]]}))
+                        ln_pr = ln_pr + (train["ln_cif"].values[-1] - last_fit["yhat"].iloc[0])
 
                 y_true_lvl = np.exp(test["ln_cif"].values)
                 ax_lvl = np.exp(ln_ax)
