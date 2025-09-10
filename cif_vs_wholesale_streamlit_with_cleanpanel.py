@@ -541,18 +541,33 @@ def forecast_lnwh(df, h, vecm_res=None, method="vec"):
         return np.repeat(last_ln_wh, h), np.repeat(last_ln_cif, h)
 
 def build_future_xreg(df, L, h, beta, mu, ln_wh_future, ln_cif0):
+    # --- Δln_wh 미래 라그 행렬 ---
     d_hist = np.r_[np.nan, np.diff(df["ln_wh"].values)]
     d_fut  = np.r_[np.nan, np.diff(np.r_[df["ln_wh"].values[-1], ln_wh_future])][1:]
     d_pad  = np.r_[d_hist[-L:], d_fut]
     Xcols  = {f"dln_wh_L{lag}": d_pad[(L - lag):(L - lag + h)] for lag in range(L + 1)}
     Xf = pd.DataFrame(Xcols)
 
-    ln_cif_rep = np.repeat(float(ln_cif0), h)
-    pair = np.column_stack([ln_cif_rep, ln_wh_future])  # (h,2)
-    ect_raw = pair @ beta
-    ect_l1  = np.r_[df["ect"].values[-1], (ect_raw - mu).ravel()][0:h]  # 길이 h
+    # --- ln_cif0 스칼라/배열 모두 허용 ---
+    arr = np.asarray(ln_cif0)
+    if arr.ndim == 0:                           # 진짜 스칼라
+        ln_cif_rep = np.repeat(float(arr), h)
+    elif arr.size == 1:                          # 길이 1 벡터
+        ln_cif_rep = np.repeat(float(arr.ravel()[0]), h)
+    elif arr.size >= h:                          # 길이 h 이상인 벡터
+        ln_cif_rep = arr.ravel()[:h]
+    else:                                        # h보다 짧으면 마지막 값으로 패딩
+        ln_cif_rep = np.r_[arr.ravel(), np.repeat(float(arr.ravel()[-1]), h - arr.size)]
+
+    # --- ECT(t-1) 구성 ---
+    ln_wh_future = np.asarray(ln_wh_future).ravel()[:h]
+    pair   = np.column_stack([ln_cif_rep, ln_wh_future])     # (h, 2)
+    ect_f  = (pair @ beta - mu).ravel()                      # 미래 ECT
+    ect_l1 = np.r_[df["ect"].values[-1], ect_f][0:h]         # t-1 정렬
+
     Xf["ect_l1"] = ect_l1
     return Xf
+
 
 def shock_scale(model_resid, var_ix, use_girf=False):
     if use_girf: return 0.01
